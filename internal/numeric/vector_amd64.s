@@ -1,0 +1,590 @@
+//go:build amd64 && !purego
+
+#include "textflag.h"
+
+// Eight independent accumulators; the caller combines them in Go.
+TEXT ·partial64AVX(SB),NOSPLIT,$0-32
+	MOVQ dst+0(FP),DI
+	MOVQ src_base+8(FP),SI
+	MOVQ src_len+16(FP),CX
+	SHRQ $3,CX
+	VMOVUPD (SI),Y0
+	VMOVUPD 32(SI),Y1
+	ADDQ $64,SI
+	DECQ CX
+	JZ sum64Done
+sum64Loop:
+	VADDPD (SI),Y0,Y0
+	VADDPD 32(SI),Y1,Y1
+	ADDQ $64,SI
+	DECQ CX
+	JNZ sum64Loop
+sum64Done:
+	VMOVUPD Y0,(DI)
+	VMOVUPD Y1,32(DI)
+	VZEROUPPER
+	RET
+
+TEXT ·partial32AVX(SB),NOSPLIT,$0-32
+	MOVQ dst+0(FP),DI
+	MOVQ src_base+8(FP),SI
+	MOVQ src_len+16(FP),CX
+	SHRQ $3,CX
+	VMOVUPS (SI),Y0
+	ADDQ $32,SI
+	DECQ CX
+	JZ sum32Done
+sum32Loop:
+	VADDPS (SI),Y0,Y0
+	ADDQ $32,SI
+	DECQ CX
+	JNZ sum32Loop
+sum32Done:
+	VMOVUPS Y0,(DI)
+	VZEROUPPER
+	RET
+
+TEXT ·widenAVX(SB), NOSPLIT, $0-24
+	MOVQ dst+0(FP),DI
+	MOVQ src+8(FP),SI
+	MOVQ n+16(FP),CX
+	SHRQ $2,CX
+	JZ widenDone
+widenLoop:
+	VCVTPS2PD (SI),Y0
+	VMOVUPD Y0,(DI)
+	ADDQ $16,SI
+	ADDQ $32,DI
+	DECQ CX
+	JNZ widenLoop
+widenDone:
+	VZEROUPPER
+	RET
+
+TEXT ·narrowAVX(SB), NOSPLIT, $0-24
+	MOVQ dst+0(FP),DI
+	MOVQ src+8(FP),SI
+	MOVQ n+16(FP),CX
+	SHRQ $2,CX
+	JZ narrowDone
+narrowLoop:
+	VCVTPD2PSY (SI),X1
+	VMOVUPS X1,(DI)
+	ADDQ $32,SI
+	ADDQ $16,DI
+	DECQ CX
+	JNZ narrowLoop
+narrowDone:
+	VZEROUPPER
+	RET
+
+// CPUID: AVX + OSXSAVE, then check that OS enabled XMM and YMM state.
+TEXT ·hasAVX(SB), NOSPLIT, $0-1
+	MOVL $1, AX
+	CPUID
+	ANDL $0x18000000, CX
+	CMPL CX, $0x18000000
+	JNE noavx
+	XORL CX, CX
+	XGETBV
+	ANDL $6, AX
+	CMPL AX, $6
+	JNE noavx
+	MOVB $1, ret+0(FP)
+	RET
+noavx:
+	MOVB $0, ret+0(FP)
+	RET
+
+// Two adjacent complex values occupy one YMM register. Use the same
+// multiply/add rounding as the scalar butterfly, without FMA.
+#define BUTTERFLY_STEP(OFF) \
+	VMOVUPD OFF(SI), Y0; \
+	VMOVUPD OFF(DX), Y1; \
+	VMOVDDUP Y1, Y2; \
+	VPERMILPD $15, Y1, Y3; \
+	VPERMILPD $5, Y0, Y4; \
+	VMULPD Y2, Y0, Y0; \
+	VMULPD Y3, Y4, Y4; \
+	VADDSUBPD Y4, Y0, Y0; \
+	VMOVUPD OFF(DI), Y5; \
+	VADDPD Y0, Y5, Y6; \
+	VSUBPD Y0, Y5, Y5; \
+	VMOVUPD Y6, OFF(DI); \
+	VMOVUPD Y5, OFF(SI)
+
+TEXT ·butterflyAVX(SB), NOSPLIT, $0-72
+	MOVQ left_base+0(FP), DI
+	MOVQ right_base+24(FP), SI
+	MOVQ roots_base+48(FP), DX
+	MOVQ left_len+8(FP), CX
+	SHRQ $2, CX
+	JZ done
+loop:
+	BUTTERFLY_STEP(0)
+	BUTTERFLY_STEP(32)
+	ADDQ $64, DI
+	ADDQ $64, SI
+	ADDQ $64, DX
+	DECQ CX
+	JNZ loop
+done:
+	VZEROUPPER
+	RET
+
+DATA ·rotPos+0(SB)/8,$0x8000000000000000
+DATA ·rotPos+8(SB)/8,$0
+DATA ·rotPos+16(SB)/8,$0x8000000000000000
+DATA ·rotPos+24(SB)/8,$0
+GLOBL ·rotPos(SB), RODATA|NOPTR, $32
+DATA ·rotNeg+0(SB)/8,$0
+DATA ·rotNeg+8(SB)/8,$0x8000000000000000
+DATA ·rotNeg+16(SB)/8,$0
+DATA ·rotNeg+24(SB)/8,$0x8000000000000000
+GLOBL ·rotNeg(SB), RODATA|NOPTR, $32
+
+#define RADIX_MUL(PTR,ROOT,DST) \
+	VMOVUPD (PTR), DST; \
+	VMOVUPD (ROOT), Y4; \
+	VMOVDDUP Y4, Y5; \
+	VPERMILPD $15, Y4, Y6; \
+	VPERMILPD $5, DST, Y7; \
+	VMULPD Y5, DST, DST; \
+	VMULPD Y6, Y7, Y7; \
+	VADDSUBPD Y7, DST, DST
+
+// Fused radix-4: three complex multiplications and four output
+// butterflies, with two independent transforms in each YMM register.
+TEXT ·radix4AVX(SB), NOSPLIT, $0-104
+	MOVQ x_base+0(FP), DI
+	MOVQ w1_base+24(FP), R10
+	MOVQ w2_base+48(FP), R11
+	MOVQ w3_base+72(FP), R12
+	MOVQ w1_len+32(FP), CX
+	MOVQ CX, AX
+	SHLQ $4, AX
+	LEAQ (DI)(AX*1), SI
+	LEAQ (SI)(AX*1), R8
+	LEAQ (R8)(AX*1), R9
+	MOVQ sign+96(FP), AX
+	TESTQ AX, AX
+	JS radixneg
+	VMOVUPD ·rotPos(SB), Y15
+	JMP radixstart
+radixneg:
+	VMOVUPD ·rotNeg(SB), Y15
+radixstart:
+	SHRQ $1, CX
+	JZ radixdone
+radixloop:
+	VMOVUPD (DI), Y0
+	RADIX_MUL(SI,R10,Y1)
+	RADIX_MUL(R8,R11,Y2)
+	RADIX_MUL(R9,R12,Y3)
+	VADDPD Y1, Y0, Y8
+	VSUBPD Y1, Y0, Y0
+	VADDPD Y3, Y2, Y9
+	VSUBPD Y3, Y2, Y2
+	VPERMILPD $5, Y2, Y2
+	VXORPD Y15, Y2, Y2
+	VADDPD Y9, Y8, Y1
+	VSUBPD Y9, Y8, Y8
+	VADDPD Y2, Y0, Y3
+	VSUBPD Y2, Y0, Y0
+	VMOVUPD Y1, (DI)
+	VMOVUPD Y3, (SI)
+	VMOVUPD Y8, (R8)
+	VMOVUPD Y0, (R9)
+	ADDQ $32, DI
+	ADDQ $32, SI
+	ADDQ $32, R8
+	ADDQ $32, R9
+	ADDQ $32, R10
+	ADDQ $32, R11
+	ADDQ $32, R12
+	DECQ CX
+	JNZ radixloop
+radixdone:
+	VZEROUPPER
+	RET
+
+TEXT ·radix3AVX(SB), NOSPLIT, $0-80
+	MOVQ x_base+0(FP),DI
+	MOVQ w1_base+24(FP),R10
+	MOVQ w2_base+48(FP),R11
+	MOVQ w1_len+32(FP),CX
+	MOVQ CX,AX
+	SHLQ $4,AX
+	LEAQ (DI)(AX*1),SI
+	LEAQ (SI)(AX*1),R8
+	VBROADCASTSD ·mixedConstants(SB),Y14
+	VBROADCASTSD ·mixedConstants+8(SB),Y15
+	VBROADCASTSD sign+72(FP),Y13
+	VMULPD Y13,Y15,Y15
+	SHRQ $1,CX
+m3loop:
+	VMOVUPD (DI),Y0
+	RADIX_MUL(SI,R10,Y1)
+	RADIX_MUL(R8,R11,Y2)
+	VADDPD Y2,Y1,Y3
+	VSUBPD Y2,Y1,Y4
+	VADDPD Y3,Y0,Y1
+	VMULPD Y14,Y3,Y3
+	VSUBPD Y3,Y0,Y0
+	VPERMILPD $5,Y4,Y4
+	VXORPD ·rotPos(SB),Y4,Y4
+	VMULPD Y15,Y4,Y4
+	VADDPD Y4,Y0,Y2
+	VSUBPD Y4,Y0,Y0
+	VMOVUPD Y1,(DI)
+	VMOVUPD Y2,(SI)
+	VMOVUPD Y0,(R8)
+	ADDQ $32,DI
+	ADDQ $32,SI
+	ADDQ $32,R8
+	ADDQ $32,R10
+	ADDQ $32,R11
+	DECQ CX
+	JNZ m3loop
+	VZEROUPPER
+	RET
+
+#define MIXMUL(PTR,ROOT,DST) \
+	VMOVUPD (PTR),DST; \
+	VMOVUPD (ROOT),Y10; \
+	VMOVDDUP Y10,Y11; \
+	VPERMILPD $15,Y10,Y12; \
+	VPERMILPD $5,DST,Y13; \
+	VMULPD Y11,DST,DST; \
+	VMULPD Y12,Y13,Y13; \
+	VADDSUBPD Y13,DST,DST
+
+TEXT ·radix5AVX(SB), NOSPLIT, $0-56
+	MOVQ x_base+0(FP),DI
+	MOVQ roots_base+24(FP),SI
+	MOVQ roots_len+32(FP),CX
+	SHRQ $2,CX
+	MOVQ CX,AX
+	SHLQ $4,AX
+	LEAQ (DI)(AX*1),R8
+	LEAQ (R8)(AX*1),R9
+	LEAQ (R9)(AX*1),R10
+	LEAQ (R10)(AX*1),R11
+	LEAQ (SI)(AX*1),R12
+	LEAQ (R12)(AX*1),R13
+	LEAQ (R13)(AX*1),R15
+	VBROADCASTSD ·mixedConstants+16(SB),Y14
+	VBROADCASTSD ·mixedConstants+24(SB),Y15
+	SHRQ $1,CX
+m5loop:
+	VMOVUPD (DI),Y0
+	MIXMUL(R8,SI,Y1)
+	MIXMUL(R9,R12,Y2)
+	MIXMUL(R10,R13,Y3)
+	MIXMUL(R11,R15,Y4)
+	VADDPD Y4,Y1,Y5
+	VSUBPD Y4,Y1,Y1
+	VADDPD Y3,Y2,Y6
+	VSUBPD Y3,Y2,Y2
+	VADDPD Y5,Y0,Y7
+	VADDPD Y6,Y7,Y7
+	VMOVUPD Y7,(DI)
+	VMULPD Y14,Y5,Y8
+	VMULPD Y15,Y6,Y7
+	VADDPD Y8,Y0,Y8
+	VADDPD Y7,Y8,Y8
+	VMULPD Y15,Y5,Y9
+	VMULPD Y14,Y6,Y7
+	VADDPD Y9,Y0,Y9
+	VADDPD Y7,Y9,Y9
+	VBROADCASTSD sign+48(FP),Y12
+	VBROADCASTSD ·mixedConstants+32(SB),Y10
+	VBROADCASTSD ·mixedConstants+40(SB),Y11
+	VMULPD Y12,Y10,Y10
+	VMULPD Y12,Y11,Y11
+	VMULPD Y10,Y1,Y3
+	VMULPD Y11,Y2,Y4
+	VADDPD Y4,Y3,Y3
+	VMULPD Y11,Y1,Y1
+	VMULPD Y10,Y2,Y2
+	VSUBPD Y2,Y1,Y1
+	VPERMILPD $5,Y3,Y3
+	VXORPD ·rotPos(SB),Y3,Y3
+	VPERMILPD $5,Y1,Y1
+	VXORPD ·rotPos(SB),Y1,Y1
+	VADDPD Y3,Y8,Y4
+	VSUBPD Y3,Y8,Y8
+	VADDPD Y1,Y9,Y5
+	VSUBPD Y1,Y9,Y9
+	VMOVUPD Y4,(R8)
+	VMOVUPD Y5,(R9)
+	VMOVUPD Y9,(R10)
+	VMOVUPD Y8,(R11)
+	ADDQ $32,DI
+	ADDQ $32,R8
+	ADDQ $32,R9
+	ADDQ $32,R10
+	ADDQ $32,R11
+	ADDQ $32,SI
+	ADDQ $32,R12
+	ADDQ $32,R13
+	ADDQ $32,R15
+	DECQ CX
+	JNZ m5loop
+	VZEROUPPER
+	RET
+
+// All vector prefixes are whole 16-byte blocks. Load both operands
+// unaligned, since sliced ndarray views need not be aligned.
+#define BINARY_STEP(OP) \
+	MOVUPS (SI), X0; \
+	MOVUPS (DX), X1; \
+	OP X1, X0; \
+	MOVUPS X0, (DI); \
+	ADDQ $16, SI; \
+	ADDQ $16, DX; \
+	ADDQ $16, DI; \
+	DECQ CX
+
+TEXT ·binary64SSE2(SB), NOSPLIT, $0-73
+	MOVQ dst_base+0(FP), DI
+	MOVQ x_base+24(FP), SI
+	MOVQ y_base+48(FP), DX
+	MOVQ dst_len+8(FP), CX
+	SHRQ $1, CX
+	JZ b64done
+	MOVBLZX op+72(FP), AX
+	CMPQ AX, $1
+	JE b64sub
+	CMPQ AX, $2
+	JE b64mul
+	CMPQ AX, $3
+	JE b64div
+b64add:
+	BINARY_STEP(ADDPD)
+	JNZ b64add
+	RET
+b64sub:
+	BINARY_STEP(SUBPD)
+	JNZ b64sub
+	RET
+b64mul:
+	BINARY_STEP(MULPD)
+	JNZ b64mul
+	RET
+b64div:
+	BINARY_STEP(DIVPD)
+	JNZ b64div
+b64done:
+	RET
+
+TEXT ·binary32SSE2(SB), NOSPLIT, $0-73
+	MOVQ dst_base+0(FP), DI
+	MOVQ x_base+24(FP), SI
+	MOVQ y_base+48(FP), DX
+	MOVQ dst_len+8(FP), CX
+	SHRQ $2, CX
+	JZ b32done
+	MOVBLZX op+72(FP), AX
+	CMPQ AX, $1
+	JE b32sub
+	CMPQ AX, $2
+	JE b32mul
+	CMPQ AX, $3
+	JE b32div
+b32add:
+	BINARY_STEP(ADDPS)
+	JNZ b32add
+	RET
+b32sub:
+	BINARY_STEP(SUBPS)
+	JNZ b32sub
+	RET
+b32mul:
+	BINARY_STEP(MULPS)
+	JNZ b32mul
+	RET
+b32div:
+	BINARY_STEP(DIVPS)
+	JNZ b32div
+b32done:
+	RET
+
+#define BINARY_AVX(OP) \
+	VMOVUPD (SI), Y0; \
+	VMOVUPD (DX), Y1; \
+	OP Y1, Y0, Y0; \
+	VMOVUPD Y0, (DI); \
+	ADDQ $32, SI; \
+	ADDQ $32, DX; \
+	ADDQ $32, DI; \
+	DECQ CX
+
+TEXT ·binary64AVX(SB), NOSPLIT, $0-73
+	MOVQ dst_base+0(FP), DI
+	MOVQ x_base+24(FP), SI
+	MOVQ y_base+48(FP), DX
+	MOVQ dst_len+8(FP), CX
+	SHRQ $2, CX
+	JZ a64done
+	MOVBLZX op+72(FP), AX
+	CMPQ AX, $1
+	JE a64sub
+	CMPQ AX, $2
+	JE a64mul
+	CMPQ AX, $3
+	JE a64div
+a64add:
+	BINARY_AVX(VADDPD)
+	JNZ a64add
+	JMP a64done
+a64sub:
+	BINARY_AVX(VSUBPD)
+	JNZ a64sub
+	JMP a64done
+a64mul:
+	BINARY_AVX(VMULPD)
+	JNZ a64mul
+	JMP a64done
+a64div:
+	BINARY_AVX(VDIVPD)
+	JNZ a64div
+a64done:
+	VZEROUPPER
+	RET
+
+TEXT ·binary32AVX(SB), NOSPLIT, $0-73
+	MOVQ dst_base+0(FP), DI
+	MOVQ x_base+24(FP), SI
+	MOVQ y_base+48(FP), DX
+	MOVQ dst_len+8(FP), CX
+	SHRQ $3, CX
+	JZ a32done
+	MOVBLZX op+72(FP), AX
+	CMPQ AX, $1
+	JE a32sub
+	CMPQ AX, $2
+	JE a32mul
+	CMPQ AX, $3
+	JE a32div
+a32add:
+	BINARY_AVX(VADDPS)
+	JNZ a32add
+	JMP a32done
+a32sub:
+	BINARY_AVX(VSUBPS)
+	JNZ a32sub
+	JMP a32done
+a32mul:
+	BINARY_AVX(VMULPS)
+	JNZ a32mul
+	JMP a32done
+a32div:
+	BINARY_AVX(VDIVPS)
+	JNZ a32div
+a32done:
+	VZEROUPPER
+	RET
+
+// Broadcast a scalar once and keep it in Y1 throughout the lane.
+#define BROADCAST_STEP(OP,A,B) \
+	VMOVUPD (SI), Y0; \
+	OP A, B, Y0; \
+	VMOVUPD Y0, (DI); \
+	ADDQ $32, SI; \
+	ADDQ $32, DI; \
+	DECQ CX
+
+TEXT ·broadcast64AVX(SB), NOSPLIT, $0-57
+	MOVQ dst_base+0(FP), DI
+	MOVQ x_base+24(FP), SI
+	MOVQ dst_len+8(FP), CX
+	SHRQ $2, CX
+	JZ bc64done
+	VBROADCASTSD scalar+48(FP), Y1
+	MOVBLZX op+56(FP), AX
+	CMPQ AX, $1
+	JE bc64sub
+	CMPQ AX, $5
+	JE bc64rsub
+	CMPQ AX, $2
+	JE bc64mul
+	CMPQ AX, $6
+	JE bc64mul
+	CMPQ AX, $3
+	JE bc64div
+	CMPQ AX, $7
+	JE bc64rdiv
+bc64add:
+	BROADCAST_STEP(VADDPD,Y1,Y0)
+	JNZ bc64add
+	JMP bc64done
+bc64sub:
+	BROADCAST_STEP(VSUBPD,Y1,Y0)
+	JNZ bc64sub
+	JMP bc64done
+bc64rsub:
+	BROADCAST_STEP(VSUBPD,Y0,Y1)
+	JNZ bc64rsub
+	JMP bc64done
+bc64mul:
+	BROADCAST_STEP(VMULPD,Y1,Y0)
+	JNZ bc64mul
+	JMP bc64done
+bc64div:
+	BROADCAST_STEP(VDIVPD,Y1,Y0)
+	JNZ bc64div
+	JMP bc64done
+bc64rdiv:
+	BROADCAST_STEP(VDIVPD,Y0,Y1)
+	JNZ bc64rdiv
+bc64done:
+	VZEROUPPER
+	RET
+
+TEXT ·broadcast32AVX(SB), NOSPLIT, $0-53
+	MOVQ dst_base+0(FP), DI
+	MOVQ x_base+24(FP), SI
+	MOVQ dst_len+8(FP), CX
+	SHRQ $3, CX
+	JZ bc32done
+	VBROADCASTSS scalar+48(FP), Y1
+	MOVBLZX op+52(FP), AX
+	CMPQ AX, $1
+	JE bc32sub
+	CMPQ AX, $5
+	JE bc32rsub
+	CMPQ AX, $2
+	JE bc32mul
+	CMPQ AX, $6
+	JE bc32mul
+	CMPQ AX, $3
+	JE bc32div
+	CMPQ AX, $7
+	JE bc32rdiv
+bc32add:
+	BROADCAST_STEP(VADDPS,Y1,Y0)
+	JNZ bc32add
+	JMP bc32done
+bc32sub:
+	BROADCAST_STEP(VSUBPS,Y1,Y0)
+	JNZ bc32sub
+	JMP bc32done
+bc32rsub:
+	BROADCAST_STEP(VSUBPS,Y0,Y1)
+	JNZ bc32rsub
+	JMP bc32done
+bc32mul:
+	BROADCAST_STEP(VMULPS,Y1,Y0)
+	JNZ bc32mul
+	JMP bc32done
+bc32div:
+	BROADCAST_STEP(VDIVPS,Y1,Y0)
+	JNZ bc32div
+	JMP bc32done
+bc32rdiv:
+	BROADCAST_STEP(VDIVPS,Y0,Y1)
+	JNZ bc32rdiv
+bc32done:
+	VZEROUPPER
+	RET

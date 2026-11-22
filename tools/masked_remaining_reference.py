@@ -1,0 +1,96 @@
+import numpy as np
+import warnings
+
+
+def populate_masked_remaining(record, fails):
+    ma=np.ma
+    def r(name,value):record("ma_remaining_"+name,value)
+    def m(name,value):
+        value=ma.asarray(value)
+        r(name+"_mask",ma.getmaskarray(value))
+        r(name+"_values",ma.filled(value,0))
+    a=ma.array([[1,2,3],[4,5,6],[7,8,9]],mask=[[0,1,0],[1,1,1],[0,0,0]],fill_value=-99)
+    r("a_data",a.data);r("a_mask",a.mask)
+    fails("ma_remaining_mask_error",lambda:ma.array([1,2,3],mask=[True,False]))
+    r("mask_error_inheritance",np.array(issubclass(ma.MaskError,ma.MAError)))
+    m("copy",a.copy())
+    b=a.copy();b[0,0]=41;m("copy_mutation",b);m("copy_original",a)
+    b=a.copy();b.fill_value=-17;r("set_fill_value",b.filled());r("fill_shared",a.filled())
+    y=ma.array([1,2],fill_value=-17)
+    r("common_fill_value",np.array(ma.common_fill_value(a,y),dtype=np.int64))
+    y.fill_value=42;r("common_fill_mismatch",np.array(ma.common_fill_value(a,y) is None))
+    for d in (np.int8,np.int64,np.uint8,np.float32,np.complex64,np.bool_):
+        p=np.array([1],dtype=d)
+        default=ma.default_fill_value(p)
+        # NumPy's default values are Python scalars; compare their natural
+        # numeric representation, not a lossy cast to small integer dtype.
+        r("default_fill_"+p.dtype.name,np.array(default))
+        r("minimum_fill_"+p.dtype.name,np.array(ma.minimum_fill_value(p),dtype=d))
+        r("maximum_fill_"+p.dtype.name,np.array(ma.maximum_fill_value(p),dtype=d))
+    r("flatten_mask",ma.flatten_mask(a.mask))
+    r("isMA",np.array([ma.isMA(a),ma.isMA(a.data)]))
+    r("isMaskedArray",np.array([ma.isMaskedArray(a),ma.isMaskedArray(a.data)]))
+    r("isarray",np.array([ma.isarray(a),ma.isarray(a.data)]))
+    r("MaskType",np.array([ma.MaskType(0),ma.MaskType(3)]))
+    r("bool_",np.array([ma.bool_(0),ma.bool_(3)]))
+    r("shape",np.array(ma.shape(a),dtype=np.int64));r("ndim",np.array(ma.ndim(a),dtype=np.int64))
+    r("size",np.array(ma.size(a),dtype=np.int64))
+    e=ma.empty((2,3),dtype=np.int32);e[...] = 7;m("empty",e)
+    e=ma.empty_like(a,dtype=np.float32);e.data[...] = 6;m("empty_like",e)
+    m("frombuffer",ma.frombuffer(np.arange(5,dtype=np.int32).tobytes(),dtype=np.int32,count=3))
+    m("fromfunction",ma.fromfunction(lambda i,j:i*4+j,(2,3),dtype=np.int64))
+    m("indices",ma.indices((2,3)))
+    cube=ma.array(np.arange(24).reshape(2,3,4),mask=False)
+    cube.mask[0,0,1]=True;cube.mask[1,2,1]=True
+    r("cube_data",cube.data);r("cube_mask",cube.mask)
+    r("compress_nd",ma.compress_nd(cube,axis=(1,2)))
+    r("compress_rowcols",ma.compress_rowcols(a))
+    r("compress_all_masked",ma.compress_nd(ma.masked_all((2,3),dtype=np.int32)))
+    m("mask_rowcols",ma.mask_rowcols(a.copy()))
+    r("flatnotmasked_edges",ma.flatnotmasked_edges(a))
+    def ranges(name,seq):
+        r(name,np.array([(s.start,s.stop) for s in seq],dtype=np.int64).reshape(-1,2))
+    ranges("flatnotmasked_contiguous",ma.flatnotmasked_contiguous(a))
+    for i,group in enumerate(ma.notmasked_contiguous(a,axis=1)):
+        ranges("notmasked_contiguous_"+str(i),group)
+    for k,edges in enumerate(ma.notmasked_edges(a,axis=1)):
+        for j,v in enumerate(edges):r("notmasked_edges_"+str(k)+"_"+str(j),v)
+    enum=list(ma.ndenumerate(a))
+    r("ndenumerate_indices",np.array([i for i,_ in enum],dtype=np.int64))
+    r("ndenumerate_values",np.array([v for _,v in enum],dtype=np.int64))
+    enum=list(ma.ndenumerate(a,compressed=False))
+    r("ndenumerate_all_mask",np.array([ma.is_masked(v) for _,v in enum],dtype=bool))
+    xx=ma.array([1,3,1,5,99],mask=[0,0,0,0,1]);yy=ma.array([1,2,88],mask=[0,0,1])
+    r("x_data",xx.data);r("x_mask",xx.mask);r("y_data",yy.data);r("y_mask",yy.mask)
+    u,i,j=ma.unique(xx,return_index=True,return_inverse=True)
+    m("unique",u);r("unique_indices",i);r("unique_inverse",j)
+    for name in ("isin","in1d","intersect1d","union1d","setdiff1d","setxor1d"):
+        m(name,getattr(ma,name)(xx,yy))
+    m("isin_invert",ma.isin(xx,yy,invert=True))
+    m("setdiff1d_one_mask",ma.setdiff1d(xx,[1,2]))
+    lhs=ma.array([1,2,3,4],mask=[0,1,0,0]);rhs=ma.array([3,2,1],mask=[1,0,0])
+    r("signal_lhs_data",lhs.data);r("signal_lhs_mask",lhs.mask)
+    r("signal_rhs_data",rhs.data);r("signal_rhs_mask",rhs.mask)
+    for op,mode in (("convolve","full"),("correlate","same")):
+        for propagate in (True,False):
+            m(op+"_"+str(int(propagate)),getattr(ma,op)(lhs,rhs,mode=mode,propagate_mask=propagate))
+    mat=ma.array([[1.,2.,3.,4.,5.],[5.,3.,2.,8.,3.],[1.,6.,2.,3.,9.]],mask=[[0,1,0,0,0],[1,0,0,0,0],[0,0,0,1,0]])
+    r("cov_data",mat.data);r("cov_input_mask",mat.mask)
+    m("cov",ma.cov(mat));m("cov_rowvar_false",ma.cov(mat.T,rowvar=False,ddof=0))
+    m("corrcoef",ma.corrcoef(mat));m("corrcoef_scalar",ma.corrcoef(mat[0]))
+    m("cov_pair",ma.cov(mat[0],mat[1]))
+    fails("ma_remaining_cov_masked",lambda:ma.cov(mat,allow_masked=False))
+    m("apply_along_axis",ma.apply_along_axis(ma.sum,1,a))
+    m("apply_along_axis_vector",ma.apply_along_axis(lambda x:ma.stack([x.min(),x.max()]),1,a))
+    m("apply_over_axes",ma.apply_over_axes(ma.sum,cube,[0,2]))
+    b=a.copy();ma.put(b,[1,5,7],ma.array([20,30,40],mask=[0,1,0]));m("put",b)
+    b=a.copy().ravel();b.harden_mask();ma.put(b,[1,2],[70,80]);m("put_hard",b)
+    b=a.copy();ma.putmask(b,b.data%2==0,ma.array([100,200,300],mask=[0,1,0]));m("putmask",b)
+    b=a.copy();b.harden_mask();ma.putmask(b,b.data%2==0,ma.array([100,200,300],mask=[0,1,0]));m("putmask_hard",b)
+    r("vander",ma.vander(xx,4))
+    x=ma.array(np.arange(8,dtype=float),mask=[0,1,0,0,0,0,1,0])
+    y=ma.array(1+2*x.data+.3*x.data**2,mask=[0,0,0,1,0,0,0,0])
+    w=ma.array(np.linspace(.8,1.2,8),mask=[0,0,1,0,0,0,0,0])
+    for name,v in (("fit_x",x),("fit_y",y),("fit_w",w)):
+        r(name+"_data",v.data);r(name+"_mask",v.mask)
+    r("polyfit",ma.polyfit(x,y,2,w=w))
