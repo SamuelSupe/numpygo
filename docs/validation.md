@@ -13,6 +13,10 @@ The release source, including its final module import path and compressed test f
 | `go vet -p 2 ./...` | Passed |
 | `go mod tidy -diff` | Passed; no dependency changes |
 | `go run ./examples/scientific` | Passed: batched solve, SVD and odd-length FFT reconstruction |
+| README quick-start program | Passed: typed solve result and five-point RFFT/IRFFT round trip |
+| Focused scalar fallback tests (`-tags purego`) | Passed: Complex64 rounding, register and mixed-radix/odd FFT regressions |
+| NumPy file interchange verification | Passed: NumPy 2.5.0 independently read and verified 46 Go-written arrays |
+| API inventory regeneration | Passed: NumPy 2.5.0 regenerated the English Markdown and CSV byte-for-byte |
 | Linux/amd64 cross-compile of all Go test packages | Passed; binaries were not executed as part of this check |
 
 The repository configures separate [GitHub Actions jobs](https://github.com/SamuelSupe/numpygo/actions/workflows/ci.yml) for Linux amd64 and arm64. Consult their live results for the tagged source.
